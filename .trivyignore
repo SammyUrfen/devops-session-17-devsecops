@@ -1,0 +1,2 @@
+# Trivy ignore list. Empty on purpose: every fixable HIGH/CRITICAL must be fixed, not hidden.
+# Format: one CVE ID per line, each with a comment that says why it is safe to ignore.

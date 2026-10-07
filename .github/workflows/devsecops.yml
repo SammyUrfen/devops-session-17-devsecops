@@ -1,0 +1,158 @@
+name: DevSecOps pipeline
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/sammyurfen/devops-session-17-devsecops
+
+jobs:
+  build:
+    name: 1. Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip, cache-dependency-path: requirements-dev.txt }
+      - run: pip install -r requirements-dev.txt
+      - name: Compile all Python files
+        run: python -m compileall -q app tests && echo "build OK"
+
+  test:
+    name: 2. Unit test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip, cache-dependency-path: requirements-dev.txt }
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v --cov=app --cov-report=term --junitxml=reports/junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: test-report, path: reports/ }
+
+  sast:
+    name: 3. SAST (Bandit)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install bandit==1.9.4
+      - name: Full report (all severities, never fails)
+        run: mkdir -p reports && bandit -r app -f json -o reports/bandit.json --exit-zero && bandit -r app --exit-zero
+      - name: Gate - fail on HIGH severity
+        run: bandit -r app --severity-level high
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sast-bandit, path: reports/ }
+
+  sca:
+    name: 4. SCA (pip-audit)
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pip-audit
+      - name: Audit pinned dependencies (fails on any known vulnerability)
+        run: |
+          mkdir -p reports
+          pip-audit -r requirements-dev.txt -f json -o reports/pip-audit.json || true
+          pip-audit -r requirements-dev.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sca-pip-audit, path: reports/ }
+
+  secrets:
+    name: 5. Secret scan (gitleaks)
+    needs: sca
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # scan the whole git history, not only the last commit
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks version
+      - name: Scan history
+        run: |
+          mkdir -p reports
+          ./gitleaks git . --config .gitleaks.toml --redact --verbose --report-format sarif --report-path reports/gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: secrets-gitleaks, path: reports/ }
+
+  image:
+    name: 6-9. Docker build, image scan, gate, push
+    needs: secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 6. Docker build
+        run: docker build -t $IMAGE:${{ github.sha }} .
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.67.2
+      - name: 7. Image scan - full report (all severities, never fails)
+        run: |
+          mkdir -p reports
+          trivy image --format json -o reports/trivy-image.json $IMAGE:${{ github.sha }}
+          trivy image --skip-db-update --severity LOW,MEDIUM,HIGH,CRITICAL $IMAGE:${{ github.sha }} | tee reports/trivy-image.txt
+      - name: 8. Security gate - fail on fixable HIGH/CRITICAL
+        run: |
+          trivy image --skip-db-update --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+            --ignorefile .trivyignore $IMAGE:${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: image-scan-trivy, path: reports/ }
+      - name: 9. Push to GHCR (main only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+  deploy:
+    name: 10. Deploy to Kubernetes (kind)
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with: { cluster_name: s17 }
+      - run: kubectl version && kubectl get nodes -o wide
+      - name: Pull Secret for GHCR
+        run: |
+          kubectl create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} --docker-password=${{ secrets.GITHUB_TOKEN }}
+      - name: Apply manifests with the image built in this run
+        run: |
+          sed -i "s|__IMAGE__|$IMAGE:${{ github.sha }}|" k8s/deployment.yaml
+          kubectl apply -f k8s/
+          kubectl rollout status deployment/session17-python --timeout=180s
+          kubectl get deploy,rs,pods,svc -o wide
+      - name: Smoke test through the Service
+        run: |
+          NODE_IP=$(kubectl get node s17-control-plane -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+          curl -sf http://$NODE_IP:30001/health
+          echo
+          curl -sf http://$NODE_IP:30001/api/greet/Bibek
+      - name: Debug on failure
+        if: failure()
+        run: kubectl describe pods; kubectl get events --sort-by=.lastTimestamp

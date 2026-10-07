@@ -1,0 +1,5 @@
+# Use every built-in gitleaks rule (AWS keys, GitHub tokens, private keys, ...).
+[extend]
+useDefault = true
+
+# Nothing is allow-listed. Add paths here only with a written reason.
