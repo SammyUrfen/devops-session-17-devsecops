@@ -102,8 +102,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: 6. Docker build
         run: docker build -t $IMAGE:${{ github.sha }} .
-      - name: Install Trivy
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.67.2
+      - name: Install Trivy (official apt repository)
+        run: |
+          curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq trivy
+          trivy --version
       - name: 7. Image scan - full report (all severities, never fails)
         run: |
           mkdir -p reports
